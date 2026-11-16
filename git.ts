@@ -153,7 +153,14 @@ function readPackSize(buffer: Buffer, offset: number): { size: number; first: nu
   return { size, first, next: pos };
 }
 
-function inflateAt(buffer: Buffer, offset: number, expectedSize: number): { data: Buffer; next: number } {
+/**
+ * The original entry-boundary search: binary-search the smallest end that
+ * inflates to the declared size. Correct on every Node, but each probe below
+ * the true end throws (a truncated stream), and every throw captures a stack
+ * trace — on the push workload that is thousands of throws per round.
+ * Kept verbatim as the fallback when the fast path below is unavailable.
+ */
+function inflateAtBinarySearch(buffer: Buffer, offset: number, expectedSize: number): { data: Buffer; next: number } {
   // Node's inflateSync ignores trailing bytes but throws on a truncated
   // stream, so the stream's end is the smallest end that inflates to the
   // declared size. Binary-search it (log n inflates, each linear).
@@ -178,6 +185,74 @@ function inflateAt(buffer: Buffer, offset: number, expectedSize: number): { data
   }
   if (answer === -1 || answerData === null) throw new Error('could not inflate pack entry');
   return { data: answerData, next: answer };
+}
+
+/**
+ * Whether this Node's inflateSync reports how much input it consumed.
+ * Probe once, at first use: inflate a known stream with trailing bytes and
+ * check that `engine.bytesWritten` is exactly the stream's length. When the
+ * runtime does not support the `info` option (or reports anything else),
+ * the probe fails and every call uses the binary search above — same bytes
+ * in, same bytes out, just slower.
+ */
+let inflateReportsLength: boolean | null = null;
+
+/**
+ * The probe itself, with no caching: inflate a known stream with trailing
+ * bytes and report whether `engine.bytesWritten` is exactly the stream's
+ * length. Any failure (no `info` support, a wrong value, a throw) is false.
+ */
+function probeInflateReportsConsumedLength(): boolean {
+  try {
+    const probe = deflateSync(Buffer.from('forge-probe'));
+    const tailed = Buffer.concat([probe, Buffer.from('trailing-bytes')]);
+    const result = inflateSync(tailed, { info: true }) as unknown as {
+      buffer: Buffer;
+      engine?: { bytesWritten?: unknown };
+    };
+    return (
+      result.buffer.toString('utf8') === 'forge-probe' &&
+      typeof result.engine?.bytesWritten === 'number' &&
+      result.engine.bytesWritten === probe.length
+    );
+  } catch {
+    return false;
+  }
+}
+
+function inflateReportsConsumedLength(): boolean {
+  if (inflateReportsLength === null) inflateReportsLength = probeInflateReportsConsumedLength();
+  return inflateReportsLength;
+}
+
+function inflateAt(buffer: Buffer, offset: number, expectedSize: number): { data: Buffer; next: number } {
+  if (inflateReportsConsumedLength()) {
+    try {
+      // One inflate, no throws on the good path: inflateSync stops at the
+      // end of the deflate stream and ignores the bytes after it (the next
+      // entries), and `engine.bytesWritten` is exactly how many input bytes
+      // the stream consumed — the entry's end. The size check rejects a
+      // corrupt entry before its end is trusted.
+      const result = inflateSync(buffer.subarray(offset), { info: true }) as unknown as {
+        buffer: Buffer;
+        engine?: { bytesWritten?: unknown };
+      };
+      const consumed = result.engine?.bytesWritten;
+      if (
+        result.buffer.length === expectedSize &&
+        typeof consumed === 'number' &&
+        Number.isInteger(consumed) &&
+        consumed > 0 &&
+        offset + consumed <= buffer.length
+      ) {
+        return { data: result.buffer, next: offset + consumed };
+      }
+    } catch {
+      // A truncated or corrupt entry: fall through to the binary search,
+      // which raises the same error the old code raised.
+    }
+  }
+  return inflateAtBinarySearch(buffer, offset, expectedSize);
 }
 
 function applyDelta(base: Buffer, delta: Buffer): Buffer {
